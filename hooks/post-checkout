@@ -1,0 +1,48 @@
+#!/bin/bash
+# Global post-checkout hook (core.hooksPath = ~/.config/git/hooks).
+# Args: $1 = previous HEAD (all zeros on fresh checkout), $2 = new HEAD,
+#       $3 = 1 for branch checkout, 0 for file checkout.
+
+# herdr notification on `git worktree add` (mirrors git_wt_clone in ~/.bashrc).
+# A fresh worktree checkout has an all-zeros $1; the git-dir vs common-dir
+# check excludes `git clone`, which also starts from all-zeros.
+if [[ "$1" =~ ^0+$ && "$3" == "1" ]] \
+    && [[ "$(git rev-parse --git-dir)" != "$(git rev-parse --git-common-dir)" ]] \
+    && [[ -n "${HERDR_WORKSPACE_ID:-}" ]] \
+    && command -v herdr >/dev/null; then
+
+    branch=$(git branch --show-current)
+    label=${branch:-$(git rev-parse --short HEAD)}
+    # herdr refuses --workspace/--cwd inside a linked worktree
+    # (linked_worktree_source); it wants the repo parent root as --cwd.
+    repo_root=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+
+    opened=$(herdr worktree open \
+        --cwd "$repo_root" \
+        --path "$PWD" \
+        --label "$label" \
+        --no-focus \
+        --json)
+
+    # Keep one token per exact workspace. Metadata updates merge atomically,
+    # so later checkouts (including detached ones) cannot overwrite ownership.
+    workspace_token=$(python3 -c '
+import hashlib, json, sys
+w = json.load(sys.stdin)["result"]["workspace"]
+identity = w["worktree"]["repo_key"] + "\0" + w["worktree"]["checkout_path"]
+print("worktree_space_" + w["workspace_id"] + "=" + hashlib.sha256(identity.encode()).hexdigest())
+' <<< "$opened")
+
+    if [[ -n "${HERDR_PANE_ID:-}" && -n "$workspace_token" ]]; then
+        herdr pane report-metadata "$HERDR_PANE_ID" \
+            --source git-worktree-add \
+            --token "worktree_branch=$label" \
+            --token "$workspace_token" >/dev/null
+    fi
+fi
+
+# core.hooksPath replaces repo-local hooks entirely; chain so they still run.
+local_hook="$(git rev-parse --git-common-dir)/hooks/post-checkout"
+if [[ -x "$local_hook" ]]; then
+    exec "$local_hook" "$@"
+fi

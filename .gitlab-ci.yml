@@ -1,0 +1,7 @@
+image: python:3.12-slim
+
+test:
+  script:
+    - python3 -B -m unittest discover -s tests -v
+    - bash -n hooks/post-checkout
+    - python3 -c 'import tomllib; tomllib.load(open("herdr-plugin.toml", "rb"))'

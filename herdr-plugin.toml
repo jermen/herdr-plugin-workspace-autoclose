@@ -1,0 +1,43 @@
+id = "jermen.auto-close-worktrees"
+name = "Workspace Autoclose"
+version = "0.6.0"
+min_herdr_version = "0.9.1"
+description = "Close worktree spaces after completion, directory removal, or agent exit."
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["python3", "autoclose.py", "start"]
+
+[[actions]]
+id = "start"
+title = "Start workspace autoclose"
+command = ["python3", "autoclose.py", "start"]
+
+# Hooks only ensure one watcher is running; it subscribes to actual events.
+[[events]]
+on = "pane.agent_detected"
+command = ["python3", "autoclose.py", "start"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "autoclose.py", "start"]
+
+[[events]]
+on = "worktree.opened"
+command = ["python3", "autoclose.py", "start"]
+
+[[events]]
+on = "worktree.created"
+command = ["python3", "autoclose.py", "start"]
+
+[[events]]
+on = "pane.closed"
+command = ["python3", "autoclose.py", "start"]
+
+[[events]]
+on = "pane.exited"
+command = ["python3", "autoclose.py", "start"]
+
+[[events]]
+on = "tab.closed"
+command = ["python3", "autoclose.py", "start"]
