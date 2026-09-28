@@ -40,8 +40,7 @@ contains only idle shells. Any agent or foreground command keeps it open, and
 the repository group is checked again immediately before closure. This removes
 the empty repository entry from the menu. All Git checkouts remain intact.
 
-This implements [DMDOX-316](https://dmdox.atlassian.net/browse/DMDOX-316) and retains
-the existing plugin ID `jermen.auto-close-worktrees`.
+The plugin ID is `jermen.auto-close-worktrees`.
 
 ## Requirements
 
@@ -49,9 +48,21 @@ the existing plugin ID `jermen.auto-close-worktrees`.
 - Herdr 0.9.1 or newer.
 - No pip packages, npm packages, external plugins, or build step.
 
-## Install from a checkout
+## Install
 
-Run inside a Herdr pane, from the branch checkout you want to test:
+```sh
+herdr plugin install jermen/herdr-plugin-workspace-autoclose --yes
+herdr plugin action invoke jermen.auto-close-worktrees.start
+```
+
+Reinstalling with `herdr plugin install` updates the checkout in place; invoke
+Start again afterwards. Then install the [Git checkout hook](#git-checkout-hook).
+
+## Develop from a checkout
+
+Uninstall the installed copy first (`herdr plugin uninstall
+jermen.auto-close-worktrees`), then run inside a Herdr pane, from the branch
+checkout you want to test:
 
 ```sh
 herdr plugin link "$PWD"
@@ -93,9 +104,16 @@ It requires Python 3 and the Herdr caller environment. Install it in the configu
 Git hooks directory to enable associations across multiple repositories. Preserve
 any additional behavior when integrating it into an existing global hook.
 
-For this workstation the configured destination is
-`~/.config/git/hooks/post-checkout`. The installed hook is a standalone copy,
-so relinking the plugin to another checkout does not break Git integration.
+For example, with `core.hooksPath` set to `~/.config/git/hooks`:
+
+```sh
+curl -fsSL -o ~/.config/git/hooks/post-checkout \
+  https://raw.githubusercontent.com/jermen/herdr-plugin-workspace-autoclose/master/hooks/post-checkout
+chmod 755 ~/.config/git/hooks/post-checkout
+```
+
+The installed hook is a standalone copy, so reinstalling the plugin or linking
+another checkout does not break Git integration.
 It affects future worktree creation; it cannot recover the ownership of panes
 that have already closed. Existing branch-only metadata remains supported.
 
