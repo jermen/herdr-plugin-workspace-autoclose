@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -17,7 +18,8 @@ def run():
         root = Path(tmp)
         env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
         env.update(XDG_CONFIG_HOME=str(root / "config"), XDG_DATA_HOME=str(root / "data"),
-                   XDG_STATE_HOME=str(root / "state"), HERDR_CONFIG_PATH=str(root / "config.toml"))
+                   XDG_STATE_HOME=str(root / "state"), HERDR_CONFIG_PATH=str(root / "config.toml"),
+                   CODEX_HOME=str(root / "codex"))
         (root / "config.toml").write_text("")
         socket_path = root / "config/herdr/sessions/autoclose-integration/herdr.sock"
         client = app.Client(str(socket_path))
@@ -86,6 +88,50 @@ def run():
             assert client.call("plugin.list")["plugins"] == [], "plugin registry was not isolated"
             client.call("plugin.link", path=str(app.ROOT), enabled=True)
             client.call("plugin.action.invoke", plugin_id=app.PLUGIN_ID, action_id="start")
+
+            wid, pane, checkout = open_worktree("codex-false-completion")
+            session_id = "00000000-0000-4000-8000-000000000354"
+            rollout = root / "codex/sessions/2026/10/18" / f"rollout-fixture-{session_id}.jsonl"
+            rollout.parent.mkdir(parents=True)
+
+            def codex_record(kind, **payload):
+                with rollout.open("a") as f:
+                    f.write(json.dumps({"type": kind, "payload": payload,
+                                        "timestamp": "2026-10-18T19:29:38Z"}) + "\n")
+
+            codex_record("session_meta", id=session_id)
+            codex_record("event_msg", type="task_started", turn_id="aws-fixture")
+            # Exercise the native screen detector. Codex session-only hooks do
+            # not accept synthetic lifecycle reports from a different owner.
+            idle_signal = root / "codex-idle"
+            fixture = root / "codex_screen.py"
+            fixture.write_text("import sys, time\nfrom pathlib import Path\n"
+                               "print('\\x1b]0;⠋ Codex\\x07', flush=True)\n"
+                               "while not Path(sys.argv[1]).exists(): time.sleep(0.1)\n"
+                               "print('\\x1b]0;Codex\\x07\\n› Ask Codex to do anything', flush=True)\n"
+                               "time.sleep(120)\n")
+            cli("pane", "run", pane["pane_id"], "HERDR_AGENT=codex python3 "
+                + shlex.quote(str(fixture)) + " " + shlex.quote(str(idle_signal)))
+
+            def codex_state():
+                return client.call("pane.get", pane_id=pane["pane_id"])["pane"]
+
+            wait_for(lambda: codex_state().get("agent") == "codex"
+                     and codex_state().get("agent_status") == "working", "fixture was not detected as Codex")
+            client.call("pane.report_agent_session", pane_id=pane["pane_id"], source="herdr:codex",
+                        agent="codex", agent_session_id=session_id)
+            assert codex_state().get("agent_session", {}).get("value") == session_id
+            idle_signal.touch()
+            wait_for(lambda: codex_state().get("agent_status") in {"idle", "done"}, "false completion not detected")
+            time.sleep(6)
+            assert wid in spaces(), "false idle closed a Codex turn that was still running"
+            codex_record("response_item", type="custom_tool_call", name="cost-verification-fixture")
+            time.sleep(2.5)
+            assert wid in spaces(), "tool work after false completion was interrupted"
+            codex_record("event_msg", type="task_complete", turn_id="aws-fixture", root_turn_id="aws-fixture")
+            wait_for(lambda: wid not in spaces(), "native Codex completion left the workspace open")
+            assert checkout.is_dir()
+            print("PASS: false Codex completion stays open until native task_complete", flush=True)
 
             wid, pane, checkout = open_worktree("removed-directory")
             time.sleep(2.5)

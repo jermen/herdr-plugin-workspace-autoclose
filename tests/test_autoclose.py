@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -70,7 +71,7 @@ class EngineTests(unittest.TestCase):
         self.engine = app.Engine(self.api)
 
     def agent(self, status="working"):
-        self.api.panes[0].update(agent="codex", agent_status=status)
+        self.api.panes[0].update(agent="autoclose-fixture", agent_status=status)
 
     def event(self, event, **data):
         self.engine.event({"event": event, "data": {
@@ -121,7 +122,7 @@ class EngineTests(unittest.TestCase):
     def test_any_agent_protects_repository_root(self):
         self.add_primary()
         root_pane = self.api.panes[-1]
-        root_pane.update(agent="codex", agent_status="idle")
+        root_pane.update(agent="autoclose-fixture", agent_status="idle")
         self.agent("done")
         self.engine.refresh()
         for state in ["idle", "working", "blocked", "unknown", "done"]:
@@ -184,7 +185,7 @@ class EngineTests(unittest.TestCase):
             if method == "session.snapshot":
                 snapshots += 1
                 if snapshots == 3:
-                    self.api.panes[0].update(agent="codex", agent_status="idle")
+                    self.api.panes[0].update(agent="autoclose-fixture", agent_status="idle")
             return call(method, **params)
 
         with patch.object(self.api, "call", side_effect=racing_call):
@@ -269,7 +270,7 @@ class EngineTests(unittest.TestCase):
     def test_agent_in_master_is_not_sibling_cleanup(self):
         self.add_master()
         master = self.api.panes[1]
-        master.update(agent="codex", agent_status="idle")
+        master.update(agent="autoclose-fixture", agent_status="idle")
         self.agent("done")
         self.engine.refresh()
         for state in ["idle", "unknown", "blocked", "working"]:
@@ -308,7 +309,7 @@ class EngineTests(unittest.TestCase):
             if method == "session.snapshot":
                 snapshots += 1
                 if snapshots == 3:
-                    self.api.panes[0].update(agent="codex", agent_status="idle")
+                    self.api.panes[0].update(agent="autoclose-fixture", agent_status="idle")
             return call(method, **params)
 
         with patch.object(self.api, "call", side_effect=racing_call):
@@ -523,7 +524,7 @@ class SharedPaneTests(unittest.TestCase):
     agent = EngineTests.agent
     def shared_agent(self, status="working", branch="branch"):
         pane = {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
-                "terminal_id": "shared-agent", "agent": "codex", "agent_status": status,
+                "terminal_id": "shared-agent", "agent": "autoclose-fixture", "agent_status": status,
                 "tokens": {"worktree_branch": branch}}
         self.api.panes.append(pane)
         return pane
@@ -821,6 +822,189 @@ class DefaultIdentityTests(unittest.TestCase):
                       subprocess.TimeoutExpired("git", app.TIMEOUT)]:
             with self.subTest(error=error), patch.object(app.subprocess, "check_output", side_effect=error):
                 self.assertFalse(app.default_checkout(self.workspace))
+
+
+class CodexCompletionTests(unittest.TestCase):
+    setUpBase = EngineTests.setUp
+    session_id = "00000000-0000-4000-8000-000000000354"
+
+    def setUp(self):
+        self.setUpBase()
+        env = patch.dict(os.environ, {"CODEX_HOME": str(self.root / "codex")})
+        env.start()
+        self.addCleanup(env.stop)
+        clock = patch.object(app.time, "monotonic", return_value=100)
+        self.clock = clock.start()
+        self.addCleanup(clock.stop)
+        app.codex_rollout.cache_clear()
+        self.addCleanup(app.codex_rollout.cache_clear)
+        self.path = self.root / "codex/sessions/2026/10/18" / f"rollout-fixture-{self.session_id}.jsonl"
+        self.path.parent.mkdir(parents=True)
+        self.append("session_meta", id=self.session_id)
+        self.append("event_msg", type="task_started", turn_id="turn-1")
+        self.pane = self.api.panes[0]
+        self.pane.update(agent="codex", agent_status="working", agent_session={
+            "agent": "codex", "kind": "id", "value": self.session_id})
+
+    def append(self, record_type, **payload):
+        with self.path.open("a") as f:
+            f.write(json.dumps({"type": record_type, "payload": payload,
+                                "timestamp": "2026-10-18T19:29:38Z"}) + "\n")
+
+    def finish(self):
+        self.append("event_msg", type="task_complete", turn_id="turn-1", root_turn_id="turn-1")
+        self.pane["agent_status"] = "done"
+
+    def settle(self):
+        self.engine.refresh()
+        self.clock.return_value += app.COMPLETION_SETTLE + 1
+        self.engine.refresh()
+
+    def test_aws_regression_false_idle_and_done_never_close_running_turn(self):
+        self.engine.refresh()
+        for status in ("idle", "done", "working", "done", "idle"):
+            self.pane["agent_status"] = status
+            self.engine.event({"event": "pane.agent_status_changed", "data": {
+                "pane_id": self.pane["pane_id"], "agent_status": status}})
+            self.settle()
+            self.assertEqual(self.api.closed, [])
+        self.append("response_item", type="custom_tool_call", name="AWS identity check")
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+
+    def test_native_completion_closes_only_after_settling(self):
+        self.finish()
+        self.engine.refresh()
+        self.assertEqual(self.api.closed, [])
+        self.clock.return_value += app.COMPLETION_SETTLE + 1
+        self.engine.refresh()
+        self.assertEqual(self.api.closed, ["w2"])
+        self.assertTrue((self.root / "branch").is_dir())
+
+    def test_final_message_without_task_complete_is_not_completion(self):
+        self.append("response_item", type="message", role="assistant", channel="final")
+        self.pane["agent_status"] = "done"
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+
+    def test_new_turn_supersedes_previous_completion(self):
+        self.finish()
+        self.engine.refresh()
+        self.append("event_msg", type="task_started", turn_id="turn-2")
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+
+    def test_followup_message_supersedes_previous_completion(self):
+        self.finish()
+        self.append("response_item", type="message", role="user")
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+
+    def test_other_turn_completion_cannot_finish_active_turn(self):
+        self.append("event_msg", type="task_complete", turn_id="other-turn")
+        self.pane["agent_status"] = "done"
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+
+    def test_child_completion_cannot_finish_parent_turn(self):
+        self.append("event_msg", type="task_complete", turn_id="turn-1", root_turn_id="parent")
+        self.pane["agent_status"] = "done"
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+
+    def test_partial_or_invalid_tail_keeps_workspace_open(self):
+        self.finish()
+        complete = self.path.read_bytes()
+        for suffix in (b'{"type":', b'not json\n', b'[]\n'):
+            self.path.write_bytes(complete + suffix)
+            self.settle()
+            self.assertEqual(self.api.closed, [])
+
+    def test_missing_or_mismatched_identity_keeps_workspace_open(self):
+        self.finish()
+        original = self.pane["agent_session"]
+        for ref in (None, {}, {**original, "value": "../anything"},
+                    {**original, "value": "00000000-0000-0000-0000-000000000000"}):
+            self.pane["agent_session"] = ref
+            self.settle()
+            self.assertEqual(self.api.closed, [])
+
+    def test_filename_alone_is_not_session_evidence(self):
+        self.finish()
+        self.path.write_text(self.path.read_text().replace(self.session_id, "other-session"))
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+
+    def test_missing_file_can_appear_later(self):
+        self.finish()
+        data = self.path.read_bytes()
+        self.path.unlink()
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+        self.path.write_bytes(data)
+        self.settle()
+        self.assertEqual(self.api.closed, ["w2"])
+
+    def test_large_transcript_uses_bounded_tail(self):
+        self.append("response_item", type="message", text="x" * (app.CODEX_TAIL_BYTES * 2))
+        self.finish()
+        self.settle()
+        self.assertEqual(self.api.closed, ["w2"])
+
+    def test_session_header_with_base_instructions(self):
+        records = self.path.read_text().splitlines()
+        header = json.loads(records[0])
+        header["payload"]["base_instructions"] = {"text": "x" * 30000}
+        self.path.write_text(json.dumps(header) + "\n" + "\n".join(records[1:]) + "\n")
+        self.finish()
+        self.settle()
+        self.assertEqual(self.api.closed, ["w2"])
+
+    def test_new_work_during_final_recheck_prevents_close(self):
+        self.finish()
+        self.engine.refresh()
+        self.clock.return_value += app.COMPLETION_SETTLE + 1
+        original = self.api.call
+
+        def changed(method, **params):
+            if method == "workspace.get":
+                self.append("event_msg", type="task_started", turn_id="turn-2")
+            return original(method, **params)
+
+        self.api.call = changed
+        self.engine.refresh()
+        self.assertEqual(self.api.closed, [])
+
+    def test_replacement_terminal_must_settle_again(self):
+        self.finish()
+        self.engine.refresh()
+        self.clock.return_value += app.COMPLETION_SETTLE + 1
+        self.pane["terminal_id"] = "replacement"
+        self.engine.refresh()
+        self.assertEqual(self.api.closed, [])
+
+    def test_removed_directory_cannot_override_active_codex(self):
+        (self.root / "branch").rmdir()
+        self.pane["agent_status"] = "done"
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+
+    def test_other_agent_completion_cannot_kill_active_codex(self):
+        self.api.panes.append({**self.pane, "pane_id": "w2:p2", "terminal_id": "other",
+                               "agent": "autoclose-fixture", "agent_status": "done"})
+        self.pane["agent_status"] = "idle"
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+
+    def test_shared_codex_does_not_close_associated_worktree_until_finished(self):
+        self.pane.update(workspace_id="w1", pane_id="w1:p1", tokens={"worktree_branch": "branch"})
+        self.pane["agent_status"] = "done"
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+        self.finish()
+        self.settle()
+        self.assertEqual(self.api.closed, ["w2"])
+        self.assertIn(self.pane, self.api.panes)
 
 
 class TransportTests(unittest.TestCase):
