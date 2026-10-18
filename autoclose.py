@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+from functools import lru_cache
 import hashlib
 import json
 import os
 from pathlib import Path
 import select
 import socket
+import stat
 import subprocess
 import sys
 import time
+import uuid
 
 PLUGIN_ID = "jermen.auto-close-worktrees"
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +25,9 @@ EVENTS = ["pane.created", "pane.agent_detected", "pane.closed",
           "pane.exited", "tab.closed", "pane.moved", "workspace.closed",
           "worktree.created", "worktree.opened"]
 SPACE_TOKEN_PREFIX = "worktree_space_"
+CODEX_TAIL_BYTES = 1024 * 1024
+CODEX_HEADER_BYTES = 256 * 1024
+COMPLETION_SETTLE = 2.0
 
 
 def log(message):
@@ -120,6 +126,13 @@ class Client:
 def linked(workspace):
     worktree = workspace.get("worktree")
     return isinstance(worktree, dict) and worktree.get("is_linked_worktree") is True
+
+
+def externally_managed(workspace):
+    # The MCP bridge needs the original workspace for output and follow-ups.
+    # Its cleanup_task operation owns closure, including after agent exit.
+    task = workspace.get("tokens", {}).get("mcp_task")
+    return isinstance(task, str) and bool(task.strip())
 
 
 def repository_key(workspace):
@@ -223,6 +236,71 @@ def association_identity(pane):
             tuple(sorted(space_tokens(pane).items())))
 
 
+@lru_cache(maxsize=256)
+def codex_rollout(root, session_id):
+    # Bind to Herdr's native session ID, never a title, cwd, or newest file.
+    matches = list(root.glob(f"*/*/*/rollout-*-{session_id}.jsonl"))
+    if len(matches) != 1:
+        # Exceptions are not cached: a newly started session may appear later.
+        raise ValueError("missing or ambiguous Codex session")
+    return matches[0]
+
+
+def codex_completion(pane):
+    """Return bounded, native end-of-turn evidence without retaining content."""
+    session = pane.get("agent_session")
+    if not isinstance(session, dict) or session.get("agent") != "codex" or session.get("kind") != "id":
+        return None
+    session_id = session.get("value")
+    try:
+        if not isinstance(session_id, str) or str(uuid.UUID(session_id)) != session_id:
+            return None
+        root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
+        path = codex_rollout(root, session_id)
+        # Do not block the watcher on a special file or follow a replaced symlink.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                return None
+            header = json.loads(handle.readline(CODEX_HEADER_BYTES))
+            if (header.get("type") != "session_meta"
+                    or header.get("payload", {}).get("id") != session_id):
+                return None
+            start = max(0, before.st_size - CODEX_TAIL_BYTES)
+            handle.seek(start)
+            tail = handle.read(CODEX_TAIL_BYTES)
+            after = os.fstat(handle.fileno())
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            return None
+        if not tail.endswith(b"\n"):
+            return None  # A partially written record is not completion.
+        if start:
+            tail = tail.partition(b"\n")[2]
+        proof = None
+        turn_id = None
+        for line in tail.splitlines():
+            record = json.loads(line)
+            payload = record.get("payload", {})
+            if record.get("type") == "response_item":
+                proof = None  # New input, output or a tool call supersedes old completion.
+            elif record.get("type") == "event_msg":
+                event = payload.get("type")
+                if event == "task_started":
+                    turn_id, proof = payload.get("turn_id"), None
+                elif event == "task_complete":
+                    finished = payload.get("turn_id")
+                    root_turn = payload.get("root_turn_id", finished)
+                    proof = ((session_id, finished, record.get("timestamp"))
+                             if isinstance(finished, str) and finished
+                             and root_turn == finished and turn_id in (None, finished) else None)
+                elif event in {"turn_aborted", "task_aborted", "task_failed", "user_message"}:
+                    proof = None
+        return proof
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
 class Engine:
     def __init__(self, client):
         self.client = client
@@ -235,6 +313,31 @@ class Engine:
         self.exited_panes = {}
         self.external_cleanup = {}
         self.associated_completions = {}
+        self.codex_candidates = {}
+        self.codex_seen = {}
+
+    def confirmed_codex(self, pane):
+        pane_id = pane["pane_id"]
+        session = pane.get("agent_session")
+        if not isinstance(session, dict):
+            session = {}
+        occupant = (pane.get("terminal_id"), session.get("value"))
+        if pane.get("agent_status") in {"working", "done"}:
+            self.codex_seen[pane_id] = occupant
+        if self.codex_seen.get(pane_id) != occupant:
+            self.codex_candidates.pop(pane_id, None)
+            return False  # Startup idle, including a resumed old turn, is not completion.
+        proof = (codex_completion(pane)
+                 if pane.get("agent_status") in {"idle", "done"} else None)
+        if proof is None:
+            self.codex_candidates.pop(pane_id, None)
+            return False
+        identity = (pane.get("terminal_id"), proof)
+        previous, since = self.codex_candidates.get(pane_id, (None, 0))
+        if previous != identity:
+            self.codex_candidates[pane_id] = (identity, time.monotonic())
+            return False
+        return time.monotonic() - since >= COMPLETION_SETTLE
 
     def record_exit(self, pane):
         if pane.get("agent"):
@@ -250,6 +353,8 @@ class Engine:
         previous = self.previous.get(pane_id, {})
         if event == "pane.agent_status_changed":
             status = data.get("agent_status")
+            if previous.get("agent") == "codex":
+                self.confirmed_codex({**previous, "agent_status": status})
             if status == "done" or (status == "idle" and previous.get("agent_status") == "working"):
                 self.completed.add(pane_id)
             elif status in {"working", "blocked", "unknown"}:
@@ -287,6 +392,8 @@ class Engine:
                 return False
             if pane.get("agent"):
                 if status not in {"idle", "done"}:
+                    return False
+                if pane["agent"] == "codex" and not self.confirmed_codex(pane):
                     return False
                 continue
             try:
@@ -431,7 +538,12 @@ class Engine:
         for pane_id, pane in panes.items():
             old = self.previous.get(pane_id, {})
             status = pane.get("agent_status")
-            if pane.get("agent") and (status == "done" or (
+            if pane.get("agent") == "codex":
+                if self.confirmed_codex(pane):
+                    self.completed.add(pane_id)
+                else:
+                    self.completed.discard(pane_id)
+            elif pane.get("agent") and (status == "done" or (
                 status == "idle" and old.get("agent_status") == "working"
                 and pane.get("terminal_id") == old.get("terminal_id")
             )):
@@ -439,13 +551,17 @@ class Engine:
             elif status in {"working", "blocked", "unknown"}:
                 self.completed.discard(pane_id)
         self.completed.intersection_update(panes)
+        self.codex_candidates = {pid: value for pid, value in self.codex_candidates.items()
+                                 if pid in panes and panes[pid].get("agent") == "codex"}
+        self.codex_seen = {pid: value for pid, value in self.codex_seen.items()
+                           if pid in panes and panes[pid].get("agent") == "codex"}
         self.departed.intersection_update(workspaces)
         self.external_cleanup = {wid: a for wid, a in self.external_cleanup.items()
                                  if wid in workspaces and a["worktree"] == workspaces[wid].get("worktree")}
         self.associate_finished_agents(panes, workspaces)
         missing = {wid for wid, ws in workspaces.items() if missing_checkout(ws)}
         for workspace_id, workspace in workspaces.items():
-            if not linked(workspace):
+            if not linked(workspace) or externally_managed(workspace):
                 continue
             members = [p for p in panes.values() if p.get("workspace_id") == workspace_id]
             reason = None
@@ -495,6 +611,8 @@ class Engine:
         try:
             current = self.client.call("workspace.get", workspace_id=workspace_id).get("workspace")
             if not current or current.get("worktree") != workspace.get("worktree"):
+                return
+            if externally_managed(current):
                 return
             if not (primary(current) if primary_cleanup else linked(current)):
                 return

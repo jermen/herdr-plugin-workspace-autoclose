@@ -2,7 +2,8 @@
 
 Automatically close linked Git worktree **spaces in Herdr** when:
 
-- An agent finishes (`done`, or an observed `working` → `idle` transition).
+- An agent finishes (`done`, or an observed `working` → `idle` transition;
+  Codex additionally requires native completion evidence as described below).
 - The checkout directory disappears, including plain directory deletion without
   pruning Git's worktree registration.
 - An agent exits, its pane exits, or its tab closes.
@@ -11,6 +12,33 @@ The plugin closes Herdr state only. It never removes a Git worktree, branch, or
 file. Ordinary spaces stay open. A working or
 blocked agent, an agent whose state is unknown, or a foreground command in a
 shell pane prevents closure. An idle agent at initial startup is not completion.
+
+Workspaces tagged `mcp_task` belong to the dmDOX Herdr MCP bridge and are never
+automatically closed by this plugin, including after completion or agent exit.
+Use the connector's `cleanup_task` after retrieving the result and any follow-up
+work, or close the workspace manually. This preserves the live identity required
+by the connector's output and follow-up operations.
+
+### Codex completion
+
+Herdr infers Codex activity from its screen, so `idle` or `done` can appear
+between tool calls while a turn is still running. The plugin also checks the
+native session ID reported by the Herdr Codex integration. It reads only that
+session's JSONL header and at most the last 1 MiB under
+`$CODEX_HOME/sessions` (default `~/.codex/sessions`). It requires `task_complete`
+for the current root turn, followed by two seconds without new turn activity.
+The session ID, terminal and completion are checked again before closure.
+
+A new turn, follow-up input, incomplete/malformed records, an unreadable file,
+or missing session identity keeps the workspace open. There is no fallback to
+matching a directory or choosing the newest transcript. This also protects
+Codex panes during directory-removal cleanup and associated worktree cleanup
+from shared spaces. Agent exit remains a separate cleanup trigger.
+
+The watcher must run as the same OS user with access to the same Codex home.
+If it cannot verify completion (including an unsupported transcript format),
+close the workspace manually or exit Codex. Transcript text is never logged
+or copied into plugin state; only completion identifiers are held in memory.
 
 Agents can run in a shared space alongside other conversations. The Git
 post-checkout hook records each workspace opened by that pane as
@@ -152,6 +180,8 @@ Optional end-to-end tests require `herdr` and `git`:
 
 ```sh
 python3 -B tests/integration.py
+# Run only the native Codex screen/lifecycle regression:
+python3 -B tests/integration.py --codex-only
 ```
 
 The integration test creates a temporary named Herdr server, separate XDG config
@@ -162,6 +192,10 @@ closure with a remaining shell, busy-agent protection, and disabling the plugin.
 It also checks idle `master` cleanup after automatic and manual task closure,
 multiple task spaces, reopening `master`, and agents or commands in `master`.
 Root-space cleanup is covered with both busy-shell and agent protection.
+The Codex regression fixture displays false completion during an active native
+turn and verifies that the workspace remains open. It then appends `task_complete`,
+checks that MCP ownership still prevents closure, removes that ownership, and
+verifies closure while retaining the checkout. No model calls are made.
 
 Shared-space completion, agent release, pane closure, and tab closure are tested
 with an active neighboring agent. These cases also verify `main` and root cleanup.

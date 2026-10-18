@@ -1,6 +1,6 @@
 id = "jermen.auto-close-worktrees"
 name = "Workspace Autoclose"
-version = "0.6.0"
+version = "0.6.1"
 min_herdr_version = "0.9.1"
 description = "Close worktree spaces after completion, directory removal, or agent exit."
 platforms = ["linux", "macos"]
