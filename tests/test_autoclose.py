@@ -94,6 +94,24 @@ class EngineTests(unittest.TestCase):
         self.api.panes.append({"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
                                "terminal_id": "primary-shell", "agent_status": "unknown"})
 
+    def test_mcp_workspace_is_owned_by_connector_cleanup(self):
+        self.api.workspaces[1]["tokens"] = {"mcp_task": "fixture-task"}
+        self.agent("done")
+        self.engine.refresh()
+        self.assertEqual(self.api.closed, [])
+        self.api.panes[0].update(agent=None, agent_status="unknown")
+        (self.root / "branch").rmdir()
+        self.engine.refresh()
+        self.engine.refresh()
+        self.assertEqual(self.api.closed, [])
+
+    def test_mcp_ownership_added_during_recheck_prevents_close(self):
+        self.agent("done")
+        self.api.fresh_workspace = copy.deepcopy(self.api.workspaces[1])
+        self.api.fresh_workspace["tokens"] = {"mcp_task": "fixture-task"}
+        self.engine.refresh()
+        self.assertEqual(self.api.closed, [])
+
     def test_last_task_closes_idle_repository_root(self):
         self.add_primary()
         self.agent("done")
@@ -880,6 +898,18 @@ class CodexCompletionTests(unittest.TestCase):
         self.engine.refresh()
         self.assertEqual(self.api.closed, ["w2"])
         self.assertTrue((self.root / "branch").is_dir())
+
+    def test_native_completion_preserves_mcp_workspace_for_output_and_followup(self):
+        self.api.workspaces[1]["tokens"] = {"mcp_task": "fixture-task"}
+        self.finish()
+        self.settle()
+        self.assertEqual(self.api.closed, [])
+
+    def test_initial_idle_with_historical_completion_stays_open(self):
+        self.finish()
+        self.pane["agent_status"] = "idle"
+        self.settle()
+        self.assertEqual(self.api.closed, [])
 
     def test_final_message_without_task_complete_is_not_completion(self):
         self.append("response_item", type="message", role="assistant", channel="final")

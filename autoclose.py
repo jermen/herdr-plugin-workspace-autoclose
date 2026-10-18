@@ -128,6 +128,13 @@ def linked(workspace):
     return isinstance(worktree, dict) and worktree.get("is_linked_worktree") is True
 
 
+def externally_managed(workspace):
+    # The MCP bridge needs the original workspace for output and follow-ups.
+    # Its cleanup_task operation owns closure, including after agent exit.
+    task = workspace.get("tokens", {}).get("mcp_task")
+    return isinstance(task, str) and bool(task.strip())
+
+
 def repository_key(workspace):
     worktree = workspace.get("worktree")
     if isinstance(worktree, dict):
@@ -307,9 +314,19 @@ class Engine:
         self.external_cleanup = {}
         self.associated_completions = {}
         self.codex_candidates = {}
+        self.codex_seen = {}
 
     def confirmed_codex(self, pane):
         pane_id = pane["pane_id"]
+        session = pane.get("agent_session")
+        if not isinstance(session, dict):
+            session = {}
+        occupant = (pane.get("terminal_id"), session.get("value"))
+        if pane.get("agent_status") in {"working", "done"}:
+            self.codex_seen[pane_id] = occupant
+        if self.codex_seen.get(pane_id) != occupant:
+            self.codex_candidates.pop(pane_id, None)
+            return False  # Startup idle, including a resumed old turn, is not completion.
         proof = (codex_completion(pane)
                  if pane.get("agent_status") in {"idle", "done"} else None)
         if proof is None:
@@ -336,6 +353,8 @@ class Engine:
         previous = self.previous.get(pane_id, {})
         if event == "pane.agent_status_changed":
             status = data.get("agent_status")
+            if previous.get("agent") == "codex":
+                self.confirmed_codex({**previous, "agent_status": status})
             if status == "done" or (status == "idle" and previous.get("agent_status") == "working"):
                 self.completed.add(pane_id)
             elif status in {"working", "blocked", "unknown"}:
@@ -534,13 +553,15 @@ class Engine:
         self.completed.intersection_update(panes)
         self.codex_candidates = {pid: value for pid, value in self.codex_candidates.items()
                                  if pid in panes and panes[pid].get("agent") == "codex"}
+        self.codex_seen = {pid: value for pid, value in self.codex_seen.items()
+                           if pid in panes and panes[pid].get("agent") == "codex"}
         self.departed.intersection_update(workspaces)
         self.external_cleanup = {wid: a for wid, a in self.external_cleanup.items()
                                  if wid in workspaces and a["worktree"] == workspaces[wid].get("worktree")}
         self.associate_finished_agents(panes, workspaces)
         missing = {wid for wid, ws in workspaces.items() if missing_checkout(ws)}
         for workspace_id, workspace in workspaces.items():
-            if not linked(workspace):
+            if not linked(workspace) or externally_managed(workspace):
                 continue
             members = [p for p in panes.values() if p.get("workspace_id") == workspace_id]
             reason = None
@@ -590,6 +611,8 @@ class Engine:
         try:
             current = self.client.call("workspace.get", workspace_id=workspace_id).get("workspace")
             if not current or current.get("worktree") != workspace.get("worktree"):
+                return
+            if externally_managed(current):
                 return
             if not (primary(current) if primary_cleanup else linked(current)):
                 return

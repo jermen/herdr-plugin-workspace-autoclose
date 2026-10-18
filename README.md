@@ -13,6 +13,12 @@ file. Ordinary spaces stay open. A working or
 blocked agent, an agent whose state is unknown, or a foreground command in a
 shell pane prevents closure. An idle agent at initial startup is not completion.
 
+Workspaces tagged `mcp_task` belong to the dmDOX Herdr MCP bridge and are never
+automatically closed by this plugin, including after completion or agent exit.
+Use the connector's `cleanup_task` after retrieving the result and any follow-up
+work, or close the workspace manually. This preserves the live identity required
+by the connector's output and follow-up operations.
+
 ### Codex completion
 
 Herdr infers Codex activity from its screen, so `idle` or `done` can appear
@@ -174,6 +180,8 @@ Optional end-to-end tests require `herdr` and `git`:
 
 ```sh
 python3 -B tests/integration.py
+# Run only the native Codex screen/lifecycle regression:
+python3 -B tests/integration.py --codex-only
 ```
 
 The integration test creates a temporary named Herdr server, separate XDG config
@@ -184,9 +192,10 @@ closure with a remaining shell, busy-agent protection, and disabling the plugin.
 It also checks idle `master` cleanup after automatic and manual task closure,
 multiple task spaces, reopening `master`, and agents or commands in `master`.
 Root-space cleanup is covered with both busy-shell and agent protection.
-The Codex regression fixture reports false completion during an active native
-turn, verifies that the workspace remains open, then appends `task_complete`
-and verifies closure while retaining the checkout. No model calls are made.
+The Codex regression fixture displays false completion during an active native
+turn and verifies that the workspace remains open. It then appends `task_complete`,
+checks that MCP ownership still prevents closure, removes that ownership, and
+verifies closure while retaining the checkout. No model calls are made.
 
 Shared-space completion, agent release, pane closure, and tab closure are tested
 with an active neighboring agent. These cases also verify `main` and root cleanup.

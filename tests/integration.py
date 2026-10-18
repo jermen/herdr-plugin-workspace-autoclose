@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import autoclose as app
 
 
-def run():
+def run(codex_only=False):
     with tempfile.TemporaryDirectory(prefix="workspace-autoclose-integration-") as tmp:
         root = Path(tmp)
         env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
@@ -69,6 +69,7 @@ def run():
             workspace = result["workspace"]
             wid = workspace["workspace_id"]
             pane = client.call("pane.list", workspace_id=wid)["panes"][0]
+
             return wid, pane, checkout
 
         def open_worktree(name):
@@ -128,10 +129,20 @@ def run():
             codex_record("response_item", type="custom_tool_call", name="cost-verification-fixture")
             time.sleep(2.5)
             assert wid in spaces(), "tool work after false completion was interrupted"
+            client.call("workspace.report_metadata", workspace_id=wid, source="dmdox-herdr-mcp",
+                        tokens={"mcp_task": "fixture-task"})
             codex_record("event_msg", type="task_complete", turn_id="aws-fixture", root_turn_id="aws-fixture")
+            time.sleep(6)
+            assert wid in spaces(), "MCP-owned workspace was closed after native completion"
+            assert codex_state().get("agent_session", {}).get("value") == session_id
+            print("PASS: MCP ownership preserves completed Codex for output and follow-ups", flush=True)
+            client.call("workspace.report_metadata", workspace_id=wid, source="dmdox-herdr-mcp",
+                        tokens={"mcp_task": None})
             wait_for(lambda: wid not in spaces(), "native Codex completion left the workspace open")
             assert checkout.is_dir()
             print("PASS: false Codex completion stays open until native task_complete", flush=True)
+            if codex_only:
+                return
 
             wid, pane, checkout = open_worktree("removed-directory")
             time.sleep(2.5)
@@ -376,4 +387,4 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    run(codex_only="--codex-only" in sys.argv[1:])
