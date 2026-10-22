@@ -8,6 +8,11 @@ Automatically close linked Git worktree **spaces in Herdr** when:
   pruning Git's worktree registration.
 - An agent exits, its pane exits, or its tab closes.
 
+![An agent creates a worktree, Herdr opens a space for it, and the space closes when the agent finishes](docs/autoclose.gif)
+
+*A demo session with a stand-in agent: the checkout hook opens the
+`OPS-1430-login-redirect` space, which closes once the agent is done.*
+
 The plugin closes Herdr state only. It never removes a Git worktree, branch, or
 file. Ordinary spaces stay open. A working or
 blocked agent, an agent whose state is unknown, or a foreground command in a
